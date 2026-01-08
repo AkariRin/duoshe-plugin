@@ -143,7 +143,7 @@ class DuoshePlugin(BasePlugin):
     config_section_descriptions = {
         "plugin": "插件启用配置",
         "schedule": "夺舍任务调度配置",
-        "selection": "用户选择策略配置",
+        "misc": "杂项配置",
         "napcat": "Napcat服务器连接配置"
     }
 
@@ -184,11 +184,16 @@ class DuoshePlugin(BasePlugin):
                 description="最大间隔时间（分钟）"
             )
         },
-        "selection": {
+        "misc": {
             "lambda_param": ConfigField(
                 type=float,
                 default=1.5,
                 description="指数分布的λ参数，值越大越倾向于选择活跃度高的用户"
+            ),
+            "custom_cards": ConfigField(
+                type=list,
+                default=[],
+                description="自定义名片列表，将附加到候选名片列表中"
             )
         }
     }
@@ -270,7 +275,7 @@ class DuoshePlugin(BasePlugin):
         group_name = chat_stream.group_info.group_name if chat_stream and chat_stream.group_info and chat_stream.group_info.group_name else "未知群"
         group_display = f"{group_name}({group_id})"
 
-        logger.info(f"群 {group_display} 的定时任务已启动")
+        logger.debug(f"群 {group_display} 的定时任务已启动")
 
         while True:
             try:
@@ -282,10 +287,8 @@ class DuoshePlugin(BasePlugin):
 
                 # 检查是否到达执行时间
                 if current_time >= next_run:
-                    logger.info(f"群 {group_display} 开始执行夺舍任务")
-
                     # 执行夺舍任务
-                    await self._execute_duoshe(group_id, chat_id)
+                    target_user_id = await self._execute_duoshe(group_id, chat_id)
 
                     # 计算下次执行时间（随机间隔）
                     min_minutes = self.config.get("schedule", {}).get("min_interval", 360)
@@ -298,7 +301,9 @@ class DuoshePlugin(BasePlugin):
                     schedule_data[group_id] = next_run
                     self._save_schedule(schedule_data)
 
-                    logger.info(f"群 {group_display} 夺舍任务完成，下次执行时间: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(next_run))}")
+                    # 只有夺舍成功才打印日志
+                    if target_user_id:
+                        logger.info(f"群 {group_display} 已夺舍用户 {target_user_id}，下次执行时间: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(next_run))}")
 
                 # 等待到下次检查时间（每分钟检查一次）
                 await asyncio.sleep(60)
@@ -317,6 +322,9 @@ class DuoshePlugin(BasePlugin):
         Args:
             group_id: 群号
             chat_id: 聊天流ID
+
+        Returns:
+            target_user_id: 成功时返回目标用户ID，失败时返回None
         """
         # 获取群名称
         chat_stream = chat_api.get_stream_by_group_id(group_id)
@@ -357,7 +365,7 @@ class DuoshePlugin(BasePlugin):
 
             if not active_users:
                 logger.warning(f"群 {group_display} 没有活跃用户，跳过本次夺舍")
-                return
+                return None
 
             logger.debug(f"群 {group_display} 找到 {len(active_users)} 个活跃用户")
 
@@ -366,7 +374,7 @@ class DuoshePlugin(BasePlugin):
                 target_user_id = active_users[0]
             else:
                 try:
-                    lambda_param = self.config.get("selection", {}).get("lambda_param", 1.5)
+                    lambda_param = self.config.get("misc", {}).get("lambda_param", 1.5)
 
                     # 使用指数分布生成一个[0, 1)区间的随机数
                     # 然后映射到用户列表的索引
@@ -388,9 +396,9 @@ class DuoshePlugin(BasePlugin):
 
             if not target_user_id:
                 logger.warning(f"群 {group_display} 选择用户失败，跳过本次夺舍")
-                return
+                return None
 
-            logger.info(f"群 {group_display} 选择目标用户: {target_user_id}")
+            logger.debug(f"群 {group_display} 选择目标用户: {target_user_id}")
 
             # 获取napcat配置
             napcat_address = self.config.get("napcat", {}).get("address", "napcat")
@@ -407,7 +415,7 @@ class DuoshePlugin(BasePlugin):
             success, target_info = NapcatAPI.get_group_member_info(napcat_address, napcat_port, group_id, target_user_id)
             if not success:
                 logger.error(f"群 {group_display} 获取目标用户信息失败: {target_info}，跳过本次夺舍")
-                return
+                return None
 
             target_card = target_info.get("card", "") or target_info.get("nickname", "")
             logger.debug(f"群 {group_display} 目标用户群名片: {target_card}")
@@ -416,7 +424,7 @@ class DuoshePlugin(BasePlugin):
             success, bot_info = NapcatAPI.get_group_member_info(napcat_address, napcat_port, group_id, self.bot_qq)
             if not success:
                 logger.error(f"群 {group_display} 获取机器人信息失败: {bot_info}，跳过本次夺舍")
-                return
+                return None
 
             bot_card = bot_info.get("card", "") or bot_info.get("nickname", "")
             bot_role = bot_info.get("role", "member")
@@ -436,14 +444,17 @@ class DuoshePlugin(BasePlugin):
                 bot_nickname = config_api.get_global_config("bot.nickname", "")
                 bot_aliases = config_api.get_global_config("bot.alias_names", [])
 
-                # 构建候选名片列表：昵称、别名、当前群名片
+                # 构建候选名片列表：昵称、别名
                 candidates = []
                 if bot_nickname:
                     candidates.append(bot_nickname)
                 if bot_aliases:
                     candidates.extend(bot_aliases)
-                if bot_card:
-                    candidates.append(bot_card)
+
+                # 添加自定义名片列表
+                custom_cards = self.config.get("misc", {}).get("custom_cards", [])
+                if custom_cards:
+                    candidates.extend(custom_cards)
 
                 if candidates:
                     # 随机选择一个名片
@@ -459,8 +470,12 @@ class DuoshePlugin(BasePlugin):
             else:
                 logger.debug(f"群 {group_display} 机器人不是管理员，跳过修改目标用户名片")
 
+            # 返回夺舍成功的目标用户ID
+            return target_user_id
+
         except Exception as e:
             logger.error(f"群 {group_display} 执行夺舍任务失败: {e}", exc_info=True)
+            return None
 
     def get_plugin_components(self) -> List[Tuple[ComponentInfo, Type]]:
         return []
