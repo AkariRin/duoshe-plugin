@@ -106,6 +106,30 @@ class NapcatAPI:
         return True, result
 
     @staticmethod
+    def get_group_list(address: str, port: int) -> Tuple[bool, Union[List[dict], str]]:
+        """获取群列表
+
+        Args:
+            address: napcat服务器地址
+            port: napcat服务器端口
+
+        Returns:
+            (True, group_list) 成功时返回群列表
+            (False, error_msg) 失败时返回错误信息
+        """
+        url = f"http://{address}:{port}/get_group_list"
+        payload = {}
+
+        success, result = NapcatAPI._make_request(url, payload)
+        if not success:
+            return False, result
+
+        data = result.get("data")
+        if data is None:
+            return False, "获取群列表失败：返回数据为空"
+        return True, data
+
+    @staticmethod
     def get_group_member_info(address: str, port: int, group_id: str, user_id: str) -> Tuple[bool, Union[dict, str]]:
         """获取群成员信息
 
@@ -211,17 +235,32 @@ class DuoshePlugin(BasePlugin):
                 logger.error(f"初始化定时任务失败：无法获取机器人QQ号")
                 return
 
-            # 获取所有QQ群聊
-            group_streams = chat_api.get_group_streams(platform="qq")
-            logger.info(f"找到 {len(group_streams)} 个群聊，开始初始化定时任务")
+            # 获取napcat配置
+            napcat_address = self.config.get("napcat", {}).get("address", "napcat")
+            napcat_port = self.config.get("napcat", {}).get("port", 3000)
+
+            # 从napcat获取群列表
+            success, result = NapcatAPI.get_group_list(napcat_address, napcat_port)
+            if not success:
+                logger.error(f"初始化定时任务失败：获取群列表失败 - {result}")
+                return
+
+            group_list = result
+            logger.info(f"找到 {len(group_list)} 个群聊，开始初始化定时任务")
 
             # 为每个群聊创建定时任务
-            for stream in group_streams:
-                if stream.group_info:
-                    group_id = str(stream.group_info.group_id)
-                    task = asyncio.create_task(self._schedule_task(group_id, stream.stream_id))
-                    self.tasks[group_id] = task
-                    logger.debug(f"已为群 {group_id} 创建定时任务")
+            for group_info in group_list:
+                group_id = str(group_info.get("group_id", ""))
+                if not group_id:
+                    continue
+
+                # 尝试通过group_id获取stream_id，如果获取不到就使用group_id
+                chat_stream = chat_api.get_stream_by_group_id(group_id)
+                stream_id = chat_stream.stream_id if chat_stream else group_id
+
+                task = asyncio.create_task(self._schedule_task(group_id, stream_id))
+                self.tasks[group_id] = task
+                logger.debug(f"已为群 {group_id} 创建定时任务")
 
         except Exception as e:
             logger.error(f"初始化定时任务失败: {e}", exc_info=True)
@@ -274,7 +313,11 @@ class DuoshePlugin(BasePlugin):
                 schedule_data = self._load_schedule()
 
                 current_time = time.time()
-                next_run = schedule_data.get(group_id, current_time)
+                # 如果是首次执行（没有调度记录），延后10秒执行
+                if group_id not in schedule_data:
+                    next_run = current_time + 10
+                else:
+                    next_run = schedule_data.get(group_id, current_time)
 
                 # 检查是否到达执行时间
                 if current_time >= next_run:
