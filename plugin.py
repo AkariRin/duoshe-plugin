@@ -3,7 +3,7 @@ import json
 import random
 import time
 from pathlib import Path
-from typing import Optional, Type, Tuple, List, Union, Dict
+from typing import Type, Tuple, List, Union, Dict
 from urllib.request import urlopen, Request
 from urllib.error import URLError, HTTPError
 from collections import defaultdict
@@ -134,9 +134,7 @@ class NapcatAPI:
 
 @register_plugin
 class DuoshePlugin(BasePlugin):
-    """夺舍插件 - 定期随机选择活跃用户进行群名片交换"""
-
-    plugin_name = "duoshe_plugin"
+    plugin_name = "duoshe-plugin"
     enable_plugin = True
     dependencies = []
     python_dependencies = []
@@ -162,25 +160,6 @@ class DuoshePlugin(BasePlugin):
                 description="配置文件版本"
             )
         },
-        "schedule": {
-            "min_interval_minutes": ConfigField(
-                type=int,
-                default=30,
-                description="最小间隔时间（分钟）"
-            ),
-            "max_interval_minutes": ConfigField(
-                type=int,
-                default=120,
-                description="最大间隔时间（分钟）"
-            )
-        },
-        "selection": {
-            "lambda_param": ConfigField(
-                type=float,
-                default=1.5,
-                description="指数分布的λ参数，值越大越倾向于选择活跃度高的用户"
-            )
-        },
         "napcat": {
             "address": ConfigField(
                 type=str,
@@ -191,6 +170,25 @@ class DuoshePlugin(BasePlugin):
                 type=int,
                 default=3000,
                 description="Napcat服务器端口"
+            )
+        },
+        "schedule": {
+            "min_interval": ConfigField(
+                type=int,
+                default=360,
+                description="最小间隔时间（分钟）"
+            ),
+            "max_interval": ConfigField(
+                type=int,
+                default=480,
+                description="最大间隔时间（分钟）"
+            )
+        },
+        "selection": {
+            "lambda_param": ConfigField(
+                type=float,
+                default=1.5,
+                description="指数分布的λ参数，值越大越倾向于选择活跃度高的用户"
             )
         }
     }
@@ -210,7 +208,7 @@ class DuoshePlugin(BasePlugin):
             # 获取机器人QQ号
             self.bot_qq = str(config_api.get_global_config("bot.qq_account", ""))
             if not self.bot_qq:
-                logger.error(f"无法获取机器人QQ号，定时任务初始化失败")
+                logger.error(f"初始化定时任务失败：无法获取机器人QQ号")
                 return
 
             # 获取所有QQ群聊
@@ -228,11 +226,11 @@ class DuoshePlugin(BasePlugin):
         except Exception as e:
             logger.error(f"初始化定时任务失败: {e}", exc_info=True)
 
-    def _load_schedule(self) -> Dict[str, Dict[str, float]]:
+    def _load_schedule(self) -> Dict[str, float]:
         """从JSON文件加载定时计划
 
         Returns:
-            Dict[group_id, {"next_run": timestamp, "last_run": timestamp}]
+            Dict[group_id, next_run_timestamp]
         """
         if not self.schedule_file.exists():
             return {}
@@ -244,29 +242,17 @@ class DuoshePlugin(BasePlugin):
             logger.error(f"加载定时计划失败: {e}")
             return {}
 
-    def _save_schedule(self, schedule_data: Dict[str, Dict[str, float]]):
+    def _save_schedule(self, schedule_data: Dict[str, float]):
         """保存定时计划到JSON文件
 
         Args:
-            schedule_data: Dict[group_id, {"next_run": timestamp, "last_run": timestamp}]
+            schedule_data: Dict[group_id, next_run_timestamp]
         """
         try:
             with open(self.schedule_file, 'w', encoding='utf-8') as f:
                 json.dump(schedule_data, f, ensure_ascii=False, indent=2)
         except Exception as e:
             logger.error(f"保存定时计划失败: {e}")
-
-    def _get_next_interval(self) -> float:
-        """计算下次执行的随机间隔（秒）
-
-        Returns:
-            随机间隔秒数
-        """
-        min_minutes = self.config.get("schedule", {}).get("min_interval_minutes", 30)
-        max_minutes = self.config.get("schedule", {}).get("max_interval_minutes", 120)
-
-        interval_minutes = random.uniform(min_minutes, max_minutes)
-        return interval_minutes * 60
 
     async def _schedule_task(self, group_id: str, chat_id: str):
         """单个群聊的定时任务循环
@@ -275,122 +261,51 @@ class DuoshePlugin(BasePlugin):
             group_id: 群号
             chat_id: 聊天流ID
         """
-        logger.info(f"群 {group_id} 的定时任务已启动")
+        # 获取群名称
+        chat_stream = chat_api.get_stream_by_group_id(group_id)
+        group_name = chat_stream.group_info.group_name if chat_stream and chat_stream.group_info and chat_stream.group_info.group_name else "未知群"
+        group_display = f"{group_name}({group_id})"
+
+        logger.info(f"群 {group_display} 的定时任务已启动")
 
         while True:
             try:
                 # 加载定时计划
                 schedule_data = self._load_schedule()
-                group_schedule = schedule_data.get(group_id, {})
 
                 current_time = time.time()
-                next_run = group_schedule.get("next_run", current_time)
+                next_run = schedule_data.get(group_id, current_time)
 
                 # 检查是否到达执行时间
                 if current_time >= next_run:
-                    logger.info(f"群 {group_id} 开始执行夺舍任务")
+                    logger.info(f"群 {group_display} 开始执行夺舍任务")
 
                     # 执行夺舍任务
                     await self._execute_duoshe(group_id, chat_id)
 
-                    # 计算下次执行时间
-                    interval = self._get_next_interval()
+                    # 计算下次执行时间（随机间隔）
+                    min_minutes = self.config.get("schedule", {}).get("min_interval", 360)
+                    max_minutes = self.config.get("schedule", {}).get("max_interval", 480)
+                    interval_minutes = random.uniform(min_minutes, max_minutes)
+                    interval = interval_minutes * 60
                     next_run = current_time + interval
 
                     # 保存更新后的计划
-                    schedule_data[group_id] = {
-                        "next_run": next_run,
-                        "last_run": current_time
-                    }
+                    schedule_data[group_id] = next_run
                     self._save_schedule(schedule_data)
 
-                    logger.info(f"群 {group_id} 夺舍任务完成，下次执行时间: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(next_run))}")
+                    logger.info(f"群 {group_display} 夺舍任务完成，下次执行时间: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(next_run))}")
 
                 # 等待到下次检查时间（每分钟检查一次）
                 await asyncio.sleep(60)
 
             except asyncio.CancelledError:
-                logger.info(f"群 {group_id} 的定时任务已取消")
+                logger.info(f"群 {group_display} 的定时任务已取消")
                 break
             except Exception as e:
-                logger.error(f"群 {group_id} 定时任务出错: {e}", exc_info=True)
+                logger.error(f"群 {group_display} 定时任务出错: {e}", exc_info=True)
                 # 出错后等待一段时间再继续
                 await asyncio.sleep(300)
-
-    def _get_active_users(self, chat_id: str) -> List[str]:
-        """获取最近24小时的活跃用户列表，按消息数量降序排序
-
-        Args:
-            chat_id: 聊天流ID
-
-        Returns:
-            用户QQ号列表，按活跃度降序排序
-        """
-        try:
-            # 获取最近24小时的消息
-            end_time = time.time()
-            start_time = end_time - 24 * 3600
-
-            messages = message_api.get_messages_by_time_in_chat(
-                chat_id=chat_id,
-                start_time=start_time,
-                end_time=end_time,
-                filter_mai=True,  # 过滤机器人自己的消息
-                filter_command=True  # 过滤命令消息
-            )
-
-            # 统计每个用户的消息数量
-            user_message_count: Dict[str, int] = defaultdict(int)
-            for msg in messages:
-                if msg.user_info and msg.user_info.user_id:
-                    user_id = msg.user_info.user_id
-                    user_message_count[user_id] += 1
-
-            # 按消息数量降序排序
-            sorted_users = sorted(user_message_count.items(), key=lambda x: x[1], reverse=True)
-
-            # 只返回用户ID列表
-            return [user_id for user_id, _ in sorted_users]
-
-        except Exception as e:
-            logger.error(f"获取活跃用户失败: {e}", exc_info=True)
-            return []
-
-    def _select_user_with_exponential_distribution(self, users: List[str]) -> Optional[str]:
-        """使用指数分布随机选择用户
-
-        Args:
-            users: 用户列表（已按活跃度降序排序）
-
-        Returns:
-            选中的用户ID，如果列表为空则返回None
-        """
-        if not users:
-            return None
-
-        if len(users) == 1:
-            return users[0]
-
-        try:
-            lambda_param = self.config.get("selection", {}).get("lambda_param", 1.5)
-
-            # 使用指数分布生成一个[0, 1)区间的随机数
-            # 然后映射到用户列表的索引
-            random_value = random.expovariate(lambda_param)
-
-            # 将随机值映射到[0, len(users))区间
-            # 指数分布的值域是[0, +∞)，我们需要将其映射到有限区间
-            # 使用反向累积分布函数的思想，较小的值（对应活跃度高的用户）被选中的概率更大
-            index = int(random_value * len(users))
-
-            # 确保索引在有效范围内
-            index = min(index, len(users) - 1)
-
-            return users[index]
-
-        except Exception as e:
-            logger.error(f"使用指数分布选择用户失败: {e}，使用随机选择")
-            return random.choice(users)
 
     async def _execute_duoshe(self, group_id: str, chat_id: str):
         """执行夺舍操作
@@ -399,62 +314,119 @@ class DuoshePlugin(BasePlugin):
             group_id: 群号
             chat_id: 聊天流ID
         """
+        # 获取群名称
+        chat_stream = chat_api.get_stream_by_group_id(group_id)
+        group_name = chat_stream.group_info.group_name if chat_stream and chat_stream.group_info and chat_stream.group_info.group_name else "未知群"
+        group_display = f"{group_name}({group_id})"
+
         try:
-            # 1. 获取活跃用户列表
-            active_users = self._get_active_users(chat_id)
+            # ============ Step 1: 获取并统计活跃用户 ============
+            try:
+                # 获取最近24小时的消息
+                end_time = time.time()
+                start_time = end_time - 24 * 3600
+
+                messages = message_api.get_messages_by_time_in_chat(
+                    chat_id=chat_id,
+                    start_time=start_time,
+                    end_time=end_time,
+                    filter_mai=True,  # 过滤机器人自己的消息
+                    filter_command=True  # 过滤命令消息
+                )
+
+                # 统计每个用户的消息数量
+                user_message_count: Dict[str, int] = defaultdict(int)
+                for msg in messages:
+                    if msg.user_info and msg.user_info.user_id:
+                        user_id = msg.user_info.user_id
+                        user_message_count[user_id] += 1
+
+                # 按消息数量降序排序
+                sorted_users = sorted(user_message_count.items(), key=lambda x: x[1], reverse=True)
+
+                # 只保留用户ID列表
+                active_users = [user_id for user_id, _ in sorted_users]
+
+            except Exception as e:
+                logger.error(f"获取活跃用户失败: {e}", exc_info=True)
+                active_users = []
+
             if not active_users:
-                logger.warning(f"群 {group_id} 没有活跃用户，跳过本次夺舍")
+                logger.warning(f"群 {group_display} 没有活跃用户，跳过本次夺舍")
                 return
 
-            logger.debug(f"群 {group_id} 找到 {len(active_users)} 个活跃用户")
+            logger.debug(f"群 {group_display} 找到 {len(active_users)} 个活跃用户")
 
-            # 2. 使用指数分布选择用户
-            target_user_id = self._select_user_with_exponential_distribution(active_users)
+            # ============ Step 2: 使用指数分布选择目标用户 ============
+            if len(active_users) == 1:
+                target_user_id = active_users[0]
+            else:
+                try:
+                    lambda_param = self.config.get("selection", {}).get("lambda_param", 1.5)
+
+                    # 使用指数分布生成一个[0, 1)区间的随机数
+                    # 然后映射到用户列表的索引
+                    random_value = random.expovariate(lambda_param)
+
+                    # 将随机值映射到[0, len(active_users))区间
+                    # 指数分布的值域是[0, +∞)，我们需要将其映射到有限区间
+                    # 使用反向累积分布函数的思想，较小的值（对应活跃度高的用户）被选中的概率更大
+                    index = int(random_value * len(active_users))
+
+                    # 确保索引在有效范围内
+                    index = min(index, len(active_users) - 1)
+
+                    target_user_id = active_users[index]
+
+                except Exception as e:
+                    logger.error(f"使用指数分布选择用户失败: {e}，使用随机选择")
+                    target_user_id = random.choice(active_users)
+
             if not target_user_id:
-                logger.warning(f"群 {group_id} 选择用户失败，跳过本次夺舍")
+                logger.warning(f"群 {group_display} 选择用户失败，跳过本次夺舍")
                 return
 
-            logger.info(f"群 {group_id} 选择目标用户: {target_user_id}")
+            logger.info(f"群 {group_display} 选择目标用户: {target_user_id}")
 
             # 获取napcat配置
             napcat_address = self.config.get("napcat", {}).get("address", "napcat")
             napcat_port = self.config.get("napcat", {}).get("port", 3000)
 
-            # 3. 拍一拍目标用户（失败也继续）
+            # ============ Step 3: 拍一拍目标用户（失败也继续） ============
             success, result = NapcatAPI.group_poke(napcat_address, napcat_port, group_id, target_user_id)
             if success:
-                logger.info(f"群 {group_id} 成功拍了拍用户 {target_user_id}")
+                logger.debug(f"群 {group_display} 成功拍了拍用户 {target_user_id}")
             else:
-                logger.warning(f"群 {group_id} 拍一拍失败: {result}，继续执行")
+                logger.warning(f"群 {group_display} 拍一拍失败: {result}，继续执行")
 
-            # 4. 获取目标用户的群成员信息
+            # ============ Step 4: 获取目标用户和机器人的群成员信息 ============
             success, target_info = NapcatAPI.get_group_member_info(napcat_address, napcat_port, group_id, target_user_id)
             if not success:
-                logger.error(f"群 {group_id} 获取目标用户信息失败: {target_info}，跳过本次夺舍")
+                logger.error(f"群 {group_display} 获取目标用户信息失败: {target_info}，跳过本次夺舍")
                 return
 
             target_card = target_info.get("card", "") or target_info.get("nickname", "")
-            logger.info(f"群 {group_id} 目标用户群名片: {target_card}")
+            logger.debug(f"群 {group_display} 目标用户群名片: {target_card}")
 
             # 获取机器人自己的群成员信息
             success, bot_info = NapcatAPI.get_group_member_info(napcat_address, napcat_port, group_id, self.bot_qq)
             if not success:
-                logger.error(f"群 {group_id} 获取机器人信息失败: {bot_info}，跳过本次夺舍")
+                logger.error(f"群 {group_display} 获取机器人信息失败: {bot_info}，跳过本次夺舍")
                 return
 
             bot_card = bot_info.get("card", "") or bot_info.get("nickname", "")
             bot_role = bot_info.get("role", "member")
 
-            logger.info(f"群 {group_id} 机器人当前群名片: {bot_card}, 角色: {bot_role}")
+            logger.debug(f"群 {group_display} 机器人当前群名片: {bot_card}, 角色: {bot_role}")
 
-            # 5. 将自己的群名片改成目标用户的群名片
+            # ============ Step 5: 将自己的群名片改成目标用户的群名片 ============
             success, result = NapcatAPI.set_group_card(napcat_address, napcat_port, group_id, self.bot_qq, target_card)
             if success:
-                logger.info(f"群 {group_id} 成功将自己的群名片改为: {target_card}")
+                logger.debug(f"群 {group_display} 成功将自己的群名片改为: {target_card}")
             else:
-                logger.error(f"群 {group_id} 修改自己群名片失败: {result}")
+                logger.error(f"群 {group_display} 修改自己群名片失败: {result}")
 
-            # 6. 如果是管理员，修改目标用户的群名片
+            # ============ Step 6: 如果是管理员，修改目标用户的群名片 ============
             if bot_role in ["admin", "owner"]:
                 # 获取机器人的昵称和别名
                 bot_nickname = config_api.get_global_config("bot.nickname", "")
@@ -475,16 +447,16 @@ class DuoshePlugin(BasePlugin):
 
                     success, result = NapcatAPI.set_group_card(napcat_address, napcat_port, group_id, target_user_id, new_card)
                     if success:
-                        logger.info(f"群 {group_id} 成功将目标用户 {target_user_id} 的群名片改为: {new_card}")
+                        logger.debug(f"群 {group_display} 成功将目标用户 {target_user_id} 的群名片改为: {new_card}")
                     else:
-                        logger.error(f"群 {group_id} 修改目标用户群名片失败: {result}")
+                        logger.error(f"群 {group_display} 修改目标用户群名片失败: {result}")
                 else:
-                    logger.warning(f"群 {group_id} 没有可用的候选名片")
+                    logger.warning(f"群 {group_display} 没有可用的候选名片")
             else:
-                logger.info(f"群 {group_id} 机器人不是管理员，跳过修改目标用户名片")
+                logger.debug(f"群 {group_display} 机器人不是管理员，跳过修改目标用户名片")
 
         except Exception as e:
-            logger.error(f"群 {group_id} 执行夺舍任务失败: {e}", exc_info=True)
+            logger.error(f"群 {group_display} 执行夺舍任务失败: {e}", exc_info=True)
 
     def get_plugin_components(self) -> List[Tuple[ComponentInfo, Type]]:
         return []
