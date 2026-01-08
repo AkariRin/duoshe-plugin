@@ -2,7 +2,7 @@
   "manifest_version": 1,
   "name": "夺舍",
   "version": "1.0.0",
-  "description": "",
+  "description": "偷取群友的ID",
   "author": {
     "name": "梦清",
     "url": "https://github.com/AkariRin"
@@ -13,7 +13,7 @@
   },
   "homepage_url": "https://github.com/AkariRin/duoshe-plugin",
   "repository_url": "https://github.com/AkariRin/duoshe-plugin",
-  "keywords": ["夺舍"],
+  "keywords": ["夺舍", "群名片"],
   "categories": ["Entertainment & Interaction"],
   "id": "AkariRin.duoshe"
 }
